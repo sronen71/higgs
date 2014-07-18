@@ -1,7 +1,15 @@
-
+import matplotlib.pyplot as plt
 import inspect
 import os
 import sys
+import reduce_features_sym as rfs
+from sklearn.metrics import auc,roc_curve,roc_auc_score
+import sklearn.metrics as metrics
+from sklearn.svm import SVC
+
+
+from sklearn.decomposition import PCA
+from sklearn.lda import LDA
 # add path of xgboost python module
 code_path = os.path.join(
             os.path.split(inspect.getfile(inspect.currentframe()))[0], "../../python")
@@ -14,7 +22,10 @@ import numpy as np
 import scipy as sp
 import xgboost as xgb
 import sklearn.cross_validation as cv
+import reduce_features_forum as rff
 
+def fullWeight():
+    return 411691.8 
 
 def AMS(s, b):
     '''
@@ -24,9 +35,10 @@ def AMS(s, b):
     '''
     assert s >= 0
     assert b >= 0
-    bReg = 10.
+    bReg = 10
+    #print "wegihts:",s,b,(s+b)
     return np.sqrt(2.0 * ((s + b + bReg) * np.log(1 + s / (b + bReg)) - s))
-
+    
 
 def get_rates(prediction, solution, weights):
     '''
@@ -49,23 +61,59 @@ def get_training_data(training_file):
     '''
     Loads training data.
     '''
-    data = list(csv.reader(open(training_file, "rb"), delimiter=','))
-    X       = np.array([map(float, row[1:-2]) for row in data[1:]])
-    labels  = np.array([int(row[-1] == 's') for row in data[1:]])
-    weights = np.array([float(row[-2]) for row in data[1:]])
+    #data = list(csv.reader(open(training_file, "rb"), delimiter=','))
+    
+    data = np.genfromtxt('data/training.csv',delimiter=',',names=True,converters={32: lambda x:int(x=='s'.encode('utf-8'))})
+
+    select=(data['PRI_jet_num']==2) &  (data['DER_mass_MMC']!=-999) # 2 jets with DER_mass_MMC    
+        
+    data=data[select]
+    data=rfs.reduce_angles(data)
+    data=np.array(data.tolist())
+
+    X       = np.array([map(float, row[1:-2]) for row in data])
+    labels  = np.array([int(row[-1] == 1) for row in data])
+    weights = np.array([float(row[-2]) for row in data])
+    weights=weights/sum(weights)*fullWeight() # scale to full training set
+    #X=X[:,0:13] # Include only first 13 features (all DER)    
     return X, labels, weights
 
 
+def doPCA(X,lables):
+    target_names=["background","signal"]  
+    y=lables      
+    pc=PCA(n_components=3)
+    pc.fit(X)
+    #print pc.components_[0:5,:]
+    print pc.explained_variance_ratio_
+    print("PCA explained: ",sum(pc.explained_variance_ratio_))
+    X_r=pc.transform(X)
+    
+    plt.figure()
+    for c, i, target_name in zip("rg", [0, 1], target_names):
+        plt.scatter(X_r[y == i, 0], X_r[y == i, 1], c=c, label=target_name)
+    #plt.legend()
+    plt.title('PCA of Higgs data')
+
+    plt.figure()
+    for i in range(3):
+        plt.plot(range(len(pc.components_[i,:])), pc.components_[i,:],label=str(i) )   
+    plt.legend()
+
+
+    #plt.show()    
 def estimate_performance_xgboost(training_file, param, num_round, folds):
     '''
     Cross validation for XGBoost performance 
     '''
     # Load training data
     X, labels, weights = get_training_data(training_file)
-
+    doPCA(X,labels)    
+   
+    print labels.size
     # Cross validate
-    kf = cv.KFold(labels.size, n_folds=folds)
-    npoints  = 6
+    kf = cv.StratifiedKFold(labels, n_folds=folds,shuffle=True,random_state=1)
+    npoints  = 20
     # Dictionary to store all the AMSs
     all_AMS = {}
     for curr in range(npoints):
@@ -77,10 +125,12 @@ def estimate_performance_xgboost(training_file, param, num_round, folds):
         y_train, y_test = labels[train_indices], labels[test_indices]
         w_train, w_test = weights[train_indices], weights[test_indices]
 
-        # Rescale weights so that their sum is the same as for the entire training set
+        # Rescale weights s  that their sum is the same as for the entire training set
         w_train *= (sum(weights) / sum(w_train))
         w_test  *= (sum(weights) / sum(w_test))
 
+        sum_pos=sum(y_train)
+        sum_neg=sum(1-y_train)
         sum_wpos = sum(w_train[y_train == 1])
         sum_wneg = sum(w_train[y_train == 0])
 
@@ -94,6 +144,11 @@ def estimate_performance_xgboost(training_file, param, num_round, folds):
 
         watchlist = []#[(xgmat, 'train')]
         bst = xgb.train(plst, xgmat, num_round, watchlist)
+        #clf=SVC(probability=True)
+        #clf.fit(X_train,y_train,sample_weight=w_train)
+        #y_out=clf.predict_proba(X_test)[:,1]
+        
+        #print y_out[1:30]
 
         # Construct matrix for test set
         xgmat_test = xgb.DMatrix(X_test, missing=-999.0)
@@ -103,8 +158,13 @@ def estimate_performance_xgboost(training_file, param, num_round, folds):
         for k, v in sorted(res, key = lambda x:-x[1]):
             rorder[k] = len(rorder) + 1
 
+
+        eval_metric=1-roc_auc_score(y_test,y_out,sample_weight=w_test,average=None)
+        
+    
         # Explore changing threshold_ratio and compute AMS
         best_AMS = -1.
+        cut=0
         for curr, threshold_ratio in enumerate(cutoffs):
             y_pred = sp.zeros(len(y_out))
             ntop = int(threshold_ratio * len(rorder))
@@ -117,12 +177,13 @@ def estimate_performance_xgboost(training_file, param, num_round, folds):
             all_AMS[curr].append(this_AMS)
             if this_AMS > best_AMS:
                 best_AMS = this_AMS
-        print "Best AMS =", best_AMS
+                cut=threshold_ratio
+        print "s,b,ws,wb",sum_pos,sum_neg,sum_wpos,sum_wneg,"cut,Best AMS =", cut,best_AMS,"metric",eval_metric
     print "------------------------------------------------------"
-    for curr, cut in enumerate(cutoffs):
-        print "Thresh = %.2f: AMS = %.4f, std = %.4f" % \
-            (cut, sp.mean(all_AMS[curr]), sp.std(all_AMS[curr]))
-    print "------------------------------------------------------"
+    #for curr, cut in enumerate(cutoffs):
+    #    print "Thresh = %.2f: AMS = %.4f, std = %.4f" % \
+    #        (cut, sp.mean(all_AMS[curr]), sp.std(all_AMS[curr]))
+    #print "------------------------------------------------------"
 
 
 def main():
@@ -130,15 +191,15 @@ def main():
     param = {}
     # use logistic regression loss, use raw prediction before logistic transformation
     # since we only need the rank
-    param['objective'] = 'binary:logitraw'
-    param['bst:eta'] = 0.1 
-    param['bst:max_depth'] = 6
+    param['objective'] = 'binary:logistic'
+    param['bst:eta'] = 0.1
+    param['bst:max_depth'] =6  # 6 (oK; 4,5)
     param['eval_metric'] = 'auc'
     param['silent'] = 1
-    param['nthread'] = 4
+    param['nthread'] = 2
 
-    num_round = 120 # Number of boosted trees
-    folds = 5 # Folds for CV
+    num_round = 150 # Number of boosted trees
+    folds = 3 # Folds for CV
     estimate_performance_xgboost("data/training.csv", param, num_round, folds)
 
 
