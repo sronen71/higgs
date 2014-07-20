@@ -80,6 +80,13 @@ def get_training_data(data,num_jets,has_mass):
     labels  = np.array([int(row[-1] == 1) for row in data])
     weights = np.array([float(row[-2]) for row in data])
 
+    none=(X==-999).nonzero()
+    col=np.unique(none[1])
+    print col
+    for c in col:
+        print sum(X[:,c]==-999),X.shape
+    X=np.delete(X,col,1)
+    print X.shape    
     #X=X[:,0:13] # Include only first 13 features (all DER)    
     return X, labels, weights
 
@@ -159,7 +166,7 @@ def estimate_performance_xgboost(data, param, num_round, folds,jets,has_mass):
        
     #print labels.size
     # Cross validate
-    kf = cv.StratifiedKFold(labels, n_folds=folds,shuffle=True,random_state=1) #1
+    kf = cv.StratifiedKFold(labels, n_folds=folds,shuffle=True,random_state=5) #1
     npoints  = 20
     # Dictionary to store all the AMSs
     all_AMS = {}
@@ -264,7 +271,7 @@ def main():
     param['nthread'] = 2
 
     num_round = 150 # Number of boosted trees
-    folds = 5 # Folds for CV
+    folds = 3 # Folds for CV
 
     data = np.genfromtxt('data/training.csv',delimiter=',',names=True,converters={32: lambda x:int(x=='s'.encode('utf-8'))})
 
@@ -289,14 +296,15 @@ def main():
     print "optimizing mix..."       
     #guess= [0.156,0.15,0.425,0.125,0.253]
     #guess= [0.141,0.149,0.409,0.145,0.173]
-    guess=[0.111,0.140,0.377,0.087,0.209]
+    #guess=[0.111,0.140,0.377,0.087,0.209]
+    guess=[0.106,0.127,0.375,0.036,0.235]
     for fold in range(folds):
         fcases={}
         for key in cases:
             if key[1]==fold:
                 fcases[key[0]]=cases[key]
         print "guess AMS",-evalcomb(guess,fcases)
-        res=sp.optimize.basinhopping(evalcomb,x0=guess,T=4.0,
+        res=sp.optimize.basinhopping(evalcomb,x0=guess,T=0.5,
             stepsize=0.05,minimizer_kwargs={"args": (fcases,)})
         print "optimized:",res.x,-res.fun
     
