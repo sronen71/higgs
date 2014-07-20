@@ -6,10 +6,14 @@ import reduce_features_sym as rfs
 from sklearn.metrics import auc,roc_curve,roc_auc_score
 import sklearn.metrics as metrics
 from sklearn.svm import SVC
-
+import sklearn as sk
+from scipy.interpolate import interp1d
 
 from sklearn.decomposition import PCA
 from sklearn.lda import LDA
+import math
+
+
 # add path of xgboost python module
 code_path = os.path.join(
             os.path.split(inspect.getfile(inspect.currentframe()))[0], "../../python")
@@ -57,16 +61,17 @@ def get_rates(prediction, solution, weights):
     return truePos, falsePos
 
 
-def get_training_data(training_file):
+def get_training_data(data,num_jets,has_mass):
     '''
     Loads training data.
     '''
-    #data = list(csv.reader(open(training_file, "rb"), delimiter=','))
+    select=data['PRI_jet_num']==num_jets
+    if has_mass:
+        select=select & (data['DER_mass_MMC']!=-999)
+    else:
+        select= select &  (data['DER_mass_MMC']==-999) 
     
-    data = np.genfromtxt('data/training.csv',delimiter=',',names=True,converters={32: lambda x:int(x=='s'.encode('utf-8'))})
-
-    select=(data['PRI_jet_num']==2) &  (data['DER_mass_MMC']!=-999) # 2 jets with DER_mass_MMC    
-        
+    print "#jets, has_mass,#selected",num_jets,has_mass,sum(select)
     data=data[select]
     data=rfs.reduce_angles(data)
     data=np.array(data.tolist())
@@ -74,14 +79,14 @@ def get_training_data(training_file):
     X       = np.array([map(float, row[1:-2]) for row in data])
     labels  = np.array([int(row[-1] == 1) for row in data])
     weights = np.array([float(row[-2]) for row in data])
-    weights=weights/sum(weights)*fullWeight() # scale to full training set
+
     #X=X[:,0:13] # Include only first 13 features (all DER)    
     return X, labels, weights
 
 
-def doPCA(X,lables):
+def doPCA(X,labels):
     target_names=["background","signal"]  
-    y=lables      
+    y=labels      
     pc=PCA(n_components=3)
     pc.fit(X)
     #print pc.components_[0:5,:]
@@ -92,99 +97,159 @@ def doPCA(X,lables):
     plt.figure()
     for c, i, target_name in zip("rg", [0, 1], target_names):
         plt.scatter(X_r[y == i, 0], X_r[y == i, 1], c=c, label=target_name)
-    #plt.legend()
+    plt.legend()
     plt.title('PCA of Higgs data')
 
+    #plt.figure()
+    #for i in range(3):
+    #    plt.plot(range(len(pc.components_[i,:])), pc.components_[i,:],label=str(i) )   
+    #plt.legend()
+
+
+    plt.show()    
+
+
+def boots(bst,X_test,y_test,w_test,cutrange):
+    a=np.zeros(len(cutrange))
+    for k in range(10):
+        boot=np.random.choice(len(y_test),len(y_test))
+        by_test=y_test[boot]
+        bw_test=w_test[boot]
+        xgmat_test = xgb.DMatrix(X_test[boot,:], missing=-999.0)
+        y_out = bst.predict(xgmat_test)
+        ysort=np.sort(y_out)
+
+        eval_metric=1-roc_auc_score(by_test,y_out,sample_weight=bw_test,average=None)
+        fpr,tpr,thresholds=roc_curve(by_test,y_out,sample_weight=bw_test)
+        # Explore changing threshold_ratio and compute AMS
+        sum_wpos_test = sum(w_test[y_test == 1])
+        sum_wneg_test = sum(w_test[y_test == 0])
+        
+        for i,cut in enumerate(cutrange):
+            ntop=round(len(ysort)*cut)
+            th=ysort[-ntop]
+            k=np.argmax(thresholds[::-1]>=th)
+            k=len(thresholds)-1-k
+            a[i]+=AMS(tpr[k]*sum_wpos_test,fpr[k]*sum_wneg_test)
+    a=a/10.0
+    """    
     plt.figure()
-    for i in range(3):
-        plt.plot(range(len(pc.components_[i,:])), pc.components_[i,:],label=str(i) )   
-    plt.legend()
+    plt.plot(cutrange,a)
+    plt.xlabel('cut')
+    plt.ylabel('ams')
+    plt.show()
+    """
+    max_ams=max(a)
+    pos=np.where(a==max_ams)[0]
+    popratio=cutrange[pos]
+ 
 
+    print "ratio,best_Ams,metric",popratio,max_ams
+    return a 
 
-    #plt.show()    
-def estimate_performance_xgboost(training_file, param, num_round, folds):
-    '''
-    Cross validation for XGBoost performance 
-    '''
+def estimate_performance_xgboost(data, param, num_round, folds,jets,has_mass):
     # Load training data
-    X, labels, weights = get_training_data(training_file)
-    doPCA(X,labels)    
-   
-    print labels.size
+
+    X, labels, weights = get_training_data(data,jets,has_mass)
+ 
+    sum_wpos = sum(weights[labels == 1])
+    sum_wneg = sum(weights[labels == 0])
+    print "initial s,b",sum_wpos,sum_wneg
+    #doPCA(X,labels)    
+       
+    #print labels.size
     # Cross validate
-    kf = cv.StratifiedKFold(labels, n_folds=folds,shuffle=True,random_state=1)
+    kf = cv.StratifiedKFold(labels, n_folds=folds,shuffle=True,random_state=1) #1
     npoints  = 20
     # Dictionary to store all the AMSs
     all_AMS = {}
     for curr in range(npoints):
         all_AMS[curr] = []
-    # These are the cutoffs used for the XGBoost predictions
-    cutoffs  = sp.linspace(0.05, 0.30, npoints)
+    cutoffs  = np.arange(0.002,0.3,0.002)
+    ascore=np.zeros(len(cutoffs))
+    test_dic={}
+    fold=0
     for train_indices, test_indices in kf:
         X_train, X_test = X[train_indices], X[test_indices]
         y_train, y_test = labels[train_indices], labels[test_indices]
         w_train, w_test = weights[train_indices], weights[test_indices]
-
+        
         # Rescale weights s  that their sum is the same as for the entire training set
-        w_train *= (sum(weights) / sum(w_train))
-        w_test  *= (sum(weights) / sum(w_test))
+        w_train *= (fullWeight() / sum(w_train))
+        worg_test=w_test.copy()
+
+        w_test  *= (fullWeight() / sum(w_test))
 
         sum_pos=sum(y_train)
         sum_neg=sum(1-y_train)
         sum_wpos = sum(w_train[y_train == 1])
         sum_wneg = sum(w_train[y_train == 0])
-
-        # construct xgboost.DMatrix from numpy array, treat -999.0 as missing value
-        xgmat = xgb.DMatrix(X_train, label=y_train, missing=-999.0, weight=w_train)
-
-        # scale weight of positive examples
         param['scale_pos_weight'] = sum_wneg / sum_wpos
-        # you can directly throw param in, though we want to watch multiple metrics here 
+
         plst = param.items()#+[('eval_metric', 'ams@0.15')]
-
         watchlist = []#[(xgmat, 'train')]
-        bst = xgb.train(plst, xgmat, num_round, watchlist)
-        #clf=SVC(probability=True)
-        #clf.fit(X_train,y_train,sample_weight=w_train)
-        #y_out=clf.predict_proba(X_test)[:,1]
         
-        #print y_out[1:30]
+        # xgboost
 
-        # Construct matrix for test set
+        xgmat = xgb.DMatrix(X_train, label=y_train, missing=-999.0, weight=w_train)
+        bst = xgb.train(plst, xgmat, num_round, watchlist)
         xgmat_test = xgb.DMatrix(X_test, missing=-999.0)
         y_out = bst.predict(xgmat_test)
-        res  = [(i, y_out[i]) for i in xrange(len(y_out))]
-        rorder = {}
-        for k, v in sorted(res, key = lambda x:-x[1]):
-            rorder[k] = len(rorder) + 1
-
-
-        eval_metric=1-roc_auc_score(y_test,y_out,sample_weight=w_test,average=None)
+     
+        # SVM
+        #sc=sk.preprocessing.StandardScaler()
+        #X_train=sc.fit_transform(X_train)
+        #clf=SVC(verbose=True)
+        #clf.fit(X_train,y_train,sample_weight=w_train)
+        #X_test=sc.transform(X_test)
+        #y_out=clf.decision_function(X_test)
         
-    
+
+
+        ###########
+        eval_metric=1-roc_auc_score(y_test,y_out,sample_weight=w_test,average=None)
+        fpr,tpr,thresholds=roc_curve(y_test,y_out,sample_weight=w_test)
         # Explore changing threshold_ratio and compute AMS
-        best_AMS = -1.
-        cut=0
-        for curr, threshold_ratio in enumerate(cutoffs):
-            y_pred = sp.zeros(len(y_out))
-            ntop = int(threshold_ratio * len(rorder))
-            for k, v in res:
-                if rorder[k] <= ntop:
-                    y_pred[k] = 1
-
-            truePos, falsePos = get_rates(y_pred, y_test, w_test)
-            this_AMS = AMS(truePos, falsePos)
-            all_AMS[curr].append(this_AMS)
-            if this_AMS > best_AMS:
-                best_AMS = this_AMS
-                cut=threshold_ratio
-        print "s,b,ws,wb",sum_pos,sum_neg,sum_wpos,sum_wneg,"cut,Best AMS =", cut,best_AMS,"metric",eval_metric
+        sum_wpos_test = sum(w_test[y_test == 1])
+        sum_wneg_test = sum(w_test[y_test == 0])
+        a=np.zeros((len(thresholds)))
+        b=np.zeros((len(thresholds)))
+        s=np.zeros((len(thresholds)))
+        for i in range(len(thresholds)):
+            s[i]=sum_wpos_test*tpr[i]
+            b[i]=sum_wneg_test*fpr[i]
+            a[i]=AMS(s[i],b[i])
+       
+        """
+        plt.figure()
+        plt.plot(fpr, tpr, label='ROC curve')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.figure()
+        plt.plot(thresholds,a)
+        plt.xlabel('threshold')
+        plt.ylabel('ams')
+        plt.show()
+        """
+        max_ams=max(a)
+        pos=np.where(a==max_ams)[0]
+        popratio=sum(y_out>=thresholds[pos])/float(len(y_out))
+        
+        print "th,best_Ams,s,b,metric",popratio,max_ams,s[pos],b[pos],eval_metric
+        ind=np.argsort(y_out)
+        ind=ind[::-1]
+        
+        test_dic[fold]={'y':y_test[ind],'w':worg_test[ind],'popratio':popratio}
+        fold+=1
+        score=boots(bst,X_test,y_test,w_test,cutoffs)
+        ascore+=score
     print "------------------------------------------------------"
-    #for curr, cut in enumerate(cutoffs):
-    #    print "Thresh = %.2f: AMS = %.4f, std = %.4f" % \
-    #        (cut, sp.mean(all_AMS[curr]), sp.std(all_AMS[curr]))
-    #print "------------------------------------------------------"
+    ascore=ascore/len(kf) 
 
+    return test_dic
 
 def main():
     # setup parameters for xgboost
@@ -199,9 +264,56 @@ def main():
     param['nthread'] = 2
 
     num_round = 150 # Number of boosted trees
-    folds = 3 # Folds for CV
-    estimate_performance_xgboost("data/training.csv", param, num_round, folds)
+    folds = 5 # Folds for CV
 
+    data = np.genfromtxt('data/training.csv',delimiter=',',names=True,converters={32: lambda x:int(x=='s'.encode('utf-8'))})
+
+
+    cases={}
+    nn=0
+    totalWeight=[0]*folds
+    categories=[(0,True),(1,True),(2,True),(2,False),(3,True)]
+    for categ in categories:
+        jets=categ[0]
+        has_mass=categ[1]
+        test_dic=estimate_performance_xgboost(data, param, num_round, folds,jets,has_mass)
+        for fold in range(folds):
+          target=test_dic[fold]['y']
+          weights=test_dic[fold]['w']
+          ratio_guess=test_dic[fold]['popratio']
+          totalWeight[fold]+=sum(weights)
+          cases[(nn,fold)]={'target':target,'weights':weights,'ratio_guess':ratio_guess} # sorted, most signal like first
+        nn+=1
+    for key  in cases:
+        cases[key]['weights']=cases[key]['weights']*fullWeight()/totalWeight[key[1]]
+    print "optimizing mix..."       
+    #guess= [0.156,0.15,0.425,0.125,0.253]
+    #guess= [0.141,0.149,0.409,0.145,0.173]
+    guess=[0.111,0.140,0.377,0.087,0.209]
+    for fold in range(folds):
+        fcases={}
+        for key in cases:
+            if key[1]==fold:
+                fcases[key[0]]=cases[key]
+        print "guess AMS",-evalcomb(guess,fcases)
+        res=sp.optimize.basinhopping(evalcomb,x0=guess,T=4.0,
+            stepsize=0.05,minimizer_kwargs={"args": (fcases,)})
+        print "optimized:",res.x,-res.fun
+    
+def evalcomb(cuts,fcases):
+    b=0
+    s=0
+    for i in range(len(fcases)):
+        x=len(fcases[i]['weights'])*cuts[i]
+        if x>0:
+            top=math.floor(x)
+            b+=sum(fcases[i]['weights'][:top]*(1-fcases[i]['target'][:top]))
+            s+=sum(fcases[i]['weights'][:top]*fcases[i]['target'][:top])
+            if top<len(fcases[i]['weights']):
+                b+=fcases[i]['weights'][top]*(1-fcases[i]['target'][top])*(x-top)
+                s+=fcases[i]['weights'][top]*fcases[i]['target'][top]*(x-top)
+
+    return -AMS(s,b)
 
 if __name__ == "__main__":
     main()

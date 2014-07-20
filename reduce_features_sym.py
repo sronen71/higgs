@@ -25,7 +25,7 @@ def reduce_angles(X) :
     #    X[angle] = angle_invert(X[angle], invert_mask)
   
     nam=X.dtype.names
-    print X.shape
+    #print X.shape
     for k in range(len(nam)):
         if nam[k]==delta_angle:
             kd=k
@@ -35,7 +35,7 @@ def reduce_angles(X) :
     #    Xp1[angle] = -X[angle] # z symmetry together with roational symmetry implies parity in x-y as well
     #X=np.concatenate((X,Xp1))
 
-    print X.shape
+    #print X.shape
     Xadd=np.zeros((len(X),4))
     ii=0
     for angle in ['PRI_lep_phi', 'PRI_met_phi','PRI_jet_leading_phi',
@@ -53,7 +53,7 @@ def reduce_angles(X) :
 
 
     #X=X[1:5000,:]
-    print X.shape
+    #print X.shape
     return X
 
 def main():
